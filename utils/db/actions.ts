@@ -12,7 +12,7 @@ export async function createUser(email: string, name: string) {
     }
 }
 
-export async function getuUserByEmail(email : string) {
+export async function getUserByEmail(email : string) {
     try {
         const [user] = await db.select().from(Users).where(eq(Users.email, email)).execute();
         return user;
