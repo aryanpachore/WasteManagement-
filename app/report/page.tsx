@@ -1,16 +1,25 @@
 'use client'
 
-import { useState, useCallback, useEffect } from 'react'
-import {  MapPin, Upload, CheckCircle, Loader } from 'lucide-react'
-import { Button } from '@/components/ui/button'
+import { Button } from '@/components/ui/button';
+import { createReport, createUser, getRecentReports, getUserByEmail } from '@/utils/db/actions';
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import { StandaloneSearchBox,  useJsApiLoader } from '@react-google-maps/api'
-import { Libraries } from '@react-google-maps/api';
-import { createUser, getUserByEmail, createReport, getRecentReports } from '@/utils/db/actions';
+import { Libraries, StandaloneSearchBox, useJsApiLoader } from '@react-google-maps/api';
+import { CheckCircle, Loader, MapPin, Upload } from 'lucide-react';
 import { useRouter } from 'next/navigation';
-import { toast } from 'react-hot-toast'
+import { useCallback, useEffect, useState } from 'react';
+import { toast } from 'react-hot-toast';
 
 const geminiApiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
+
+// Add detailed logging
+console.log('API Key Debug:', {
+  isDefined: !!geminiApiKey,
+  length: geminiApiKey?.length,
+  firstFourChars: geminiApiKey?.substring(0, 4),
+  containsSpaces: geminiApiKey?.includes(' '),
+  rawKey: geminiApiKey // Be careful with this in production!
+});
+
 const googleMapsApiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
 
 const libraries: Libraries = ['places'];
@@ -47,7 +56,7 @@ export default function ReportPage() {
 
   const { isLoaded } = useJsApiLoader({
     id: 'google-map-script',
-    googleMapsApiKey: googleMapsApiKey!,
+    googleMapsApiKey: googleMapsApiKey || '',
     libraries: libraries
   });
 
@@ -94,14 +103,57 @@ export default function ReportPage() {
     });
   };
 
-  const handleVerify = async () => {
-    if (!file) return
+  const testApiKey = async (apiKey: string) => {
+    console.log('Testing API key:', {
+      length: apiKey.length,
+      prefix: apiKey.substring(0, 4),
+      isExpectedFormat: apiKey.match(/^AIza[A-Za-z0-9_-]{35}$/) ? 'yes' : 'no'
+    });
 
-    setVerificationStatus('verifying')
+    const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
+    try {
+      const response = await fetch(url);
+      const data = await response.json();
+      
+      console.log('API Test Results:', {
+        status: response.status,
+        ok: response.ok,
+        errorMessage: data.error?.message || 'none'
+      });
+      
+      if (!response.ok) {
+        toast.error(`API Error: ${data.error?.message || 'Unknown error'}`);
+        return false;
+      }
+      
+      return true;
+    } catch (error) {
+      console.error('API Test Error:', error);
+      toast.error(error instanceof Error ? error.message : 'Unknown error occurred');
+      return false;
+    }
+  };
+
+  const handleVerify = async () => {
+    if (!file || !geminiApiKey) {
+      toast.error('Missing file or API key');
+      return;
+    }
+
+    const cleanApiKey = geminiApiKey.trim();
+    setVerificationStatus('verifying');
     
     try {
-      const genAI = new GoogleGenerativeAI(geminiApiKey!);
-      const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+      const genAI = new GoogleGenerativeAI(cleanApiKey);
+      const model = genAI.getGenerativeModel({ 
+        model: "gemini-1.5-flash",
+        generationConfig: {
+          temperature: 0.1, // Lower temperature for more consistent output
+          topK: 32,
+          topP: 1,
+          maxOutputTokens: 4096,
+        },
+      });
 
       const base64Data = await readFileAsBase64(file);
 
@@ -114,46 +166,80 @@ export default function ReportPage() {
         },
       ];
 
-      const prompt = `You are an expert in waste management and recycling. Analyze this image and provide:
-        1. The type of waste (e.g., plastic, paper, glass, metal, organic)
-        2. An estimate of the quantity or amount (in kg or liters)
-        3. Your confidence level in this assessment (as a percentage)
-        
-        Respond in JSON format like this:
-        {
-          "wasteType": "type of waste",
-          "quantity": "estimated quantity with unit",
-          "confidence": confidence level as a number between 0 and 1
-        }`;
+      // More structured prompt to ensure valid JSON response
+      const prompt = `Analyze this waste image and respond ONLY with a valid JSON object in exactly this format, no other text:
+      {
+        "wasteType": "plastic",
+        "quantity": "2.5 kg",
+        "confidence": 0.95
+      }
+
+      Notes:
+      - wasteType must be one of: plastic, paper, glass, metal, organic
+      - quantity must include a number and unit (kg or L)
+      - confidence must be a number between 0 and 1
+      - Do not include any explanations or additional text
+      - Ensure the response is valid JSON`;
 
       const result = await model.generateContent([prompt, ...imageParts]);
       const response = await result.response;
-      const text = response.text();
+      const text = response.text().trim();
       
+      console.log('Raw AI Response:', text);
+
       try {
-        const parsedResult = JSON.parse(text);
-        if (parsedResult.wasteType && parsedResult.quantity && parsedResult.confidence) {
-          setVerificationResult(parsedResult);
-          setVerificationStatus('success');
-          setNewReport({
-            ...newReport,
-            type: parsedResult.wasteType,
-            amount: parsedResult.quantity
-          });
-        } else {
-          console.error('Invalid verification result:', parsedResult);
-          setVerificationStatus('failure');
+        // Try to clean the response if it contains markdown code blocks
+        const cleanedText = text.replace(/```json\n?|\n?```/g, '').trim();
+        console.log('Cleaned Response:', cleanedText);
+
+        const parsedResult = JSON.parse(cleanedText);
+        
+        // Validate the parsed result
+        if (!parsedResult.wasteType || !parsedResult.quantity || typeof parsedResult.confidence !== 'number') {
+          throw new Error('Response missing required fields');
         }
-      } catch (error) {
-        console.error('Failed to parse JSON response:', error);
+
+        // Validate waste type
+        const validWasteTypes = ['plastic', 'paper', 'glass', 'metal', 'organic'];
+        if (!validWasteTypes.includes(parsedResult.wasteType.toLowerCase())) {
+          throw new Error('Invalid waste type');
+        }
+
+        // Validate quantity format
+        if (!/^\d+\.?\d*\s*(kg|l)$/i.test(parsedResult.quantity)) {
+          throw new Error('Invalid quantity format');
+        }
+
+        // Validate confidence
+        if (parsedResult.confidence < 0 || parsedResult.confidence > 1) {
+          throw new Error('Invalid confidence value');
+        }
+
+        setVerificationResult(parsedResult);
+        setVerificationStatus('success');
+        setNewReport({
+          ...newReport,
+          type: parsedResult.wasteType,
+          amount: parsedResult.quantity
+        });
+
+        toast.success('Waste verification successful!');
+      } catch (parseError) {
+        console.error('Parse error:', parseError);
+        console.error('Failed response:', text);
+        toast.error(`Failed to parse AI response: ${parseError.message}`);
         setVerificationStatus('failure');
-    }
-    
+      }
     } catch (error) {
-      console.error('Error verifying waste:', error);
+      console.error('Verification error:', error);
+      if (error instanceof Error) {
+        toast.error(`Verification failed: ${error.message}`);
+      } else {
+        toast.error('Verification failed with unknown error');
+      }
       setVerificationStatus('failure');
     }
-  }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -164,6 +250,15 @@ export default function ReportPage() {
     
     setIsSubmitting(true);
     try {
+      // Define a type for the report response
+      type ReportResponse = {
+        id: number;
+        location: string;
+        wasteType: string;
+        amount: string;
+        createdAt: Date;
+      };
+
       const report = await createReport(
         user.id,
         newReport.location,
@@ -171,7 +266,7 @@ export default function ReportPage() {
         newReport.amount,
         preview || undefined,
         verificationResult ? JSON.stringify(verificationResult) : undefined
-      ) as any;
+      ) as ReportResponse; // Cast to ReportResponse instead of any
       
       const formattedReport = {
         id: report.id,
